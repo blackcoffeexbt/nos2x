@@ -26,9 +26,7 @@
       "all_frames": true
     }
   ],
-
   "permissions": ["storage", "activeTab", "windows"],
-
   "optional_permissions": ["notifications"],
   "web_accessible_resources": [
     {
@@ -41,5 +39,9 @@
         "http://*.localhost/*"
       ]
     }
-  ]
+  ],
+  "minimum_chrome_version": "106",
+  "content_security_policy": {
+    "extension_pages": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+  }
 }

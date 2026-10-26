@@ -1,62 +1,106 @@
 body {
-  color: #000000;
-  background-color: rgba(255, 255, 255, 0.974);
-  font-size: 0.9em;
+  color: #161616;
+  background: #fafafa;
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  margin: 16px;
 }
-h2 {
-  font-size: 1.3em;
-  margin: 0 0 20px;
+h1,
+h2,
+h3 {
+  margin: 16px 0 10px;
 }
-.input-button-container {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+button,
+input,
+select {
+  font: inherit;
+  padding: 7px 10px;
+  max-width: 100%;
+  box-sizing: border-box;
 }
-.modal {
-  background-color: rgba(255, 255, 255, 0.974);
-  width: 100%;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  flex-direction: column;
-}
-.modal-content {
-  padding: 0 20px;
-  width: 100%;
-  font-size: 1.3rem;
-}
-form {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-}
-
-label {
-  margin-top: 20px;
-  font-size: 20px;
-  font-weight: bold;
-}
-.text {
-  font-size: 16px;
-}
-
-.form-control {
-  max-width: -webkit-fill-available;
-  padding: 10px;
-  margin: 5px 0;
-  border: 1px solid #ccc;
-  border-radius: 5px;
-  font-size: 16px;
-}
-
-textarea.form-control {
-  height: 90px;
-}
-
-.btn {
-  border: none;
-  padding: 10px 20px;
-  border-radius: 5px;
+button {
   cursor: pointer;
+}
+button:disabled {
+  cursor: default;
+}
+input:not([type='checkbox']),
+select {
+  width: 100%;
+}
+label {
+  display: block;
+  margin: 12px 0;
+}
+label input,
+label select {
+  display: block;
+  margin-top: 4px;
+}
+fieldset {
+  border: 0;
+  padding: 0;
+  margin: 12px 0 24px;
+  min-width: 0;
+}
+.options {
+  max-width: 900px;
+  margin: auto;
+}
+.popup {
+  width: 300px;
+}
+.approval {
+  width: 100%;
+}
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.key,
+.request-data {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.request-data {
+  max-height: 180px;
+  overflow-y: auto;
+  background: #eee;
+  padding: 8px;
+}
+[role='alert'] {
+  color: #a00014;
+}
+[role='status'],
+.confirmation {
+  padding: 10px;
+  background: #fff0cf;
+}
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.checkbox input {
+  margin: 0;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th,
+td {
+  text-align: left;
+  padding: 6px;
+  border: 1px solid #ccc;
+  overflow-wrap: anywhere;
+}
+svg {
+  max-width: 100%;
+  height: auto;
 }

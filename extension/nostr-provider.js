@@ -1,11 +1,8 @@
 window.nostr = {
   _requests: {},
-  _pubkey: null,
 
   async getPublicKey() {
-    if (this._pubkey) return this._pubkey
-    this._pubkey = await this._call('getPublicKey', {})
-    return this._pubkey
+    return this._call('getPublicKey', {})
   },
 
   async peekPublicKey() {
@@ -41,22 +38,7 @@ window.nostr = {
   },
 
   _call(type, params) {
-    let id = Math.random().toString().slice(-4)
-    console.log(
-      '%c[nos2x:%c' +
-        id +
-        '%c]%c calling %c' +
-        type +
-        '%c with %c' +
-        JSON.stringify(params || {}),
-      'background-color:#f1b912;font-weight:bold;color:white',
-      'background-color:#f1b912;font-weight:bold;color:#a92727',
-      'background-color:#f1b912;color:white;font-weight:bold',
-      'color:auto',
-      'font-weight:bold;color:#08589d;font-family:monospace',
-      'color:auto',
-      'font-weight:bold;color:#90b12d;font-family:monospace'
-    )
+    let id = crypto.randomUUID()
     return new Promise((resolve, reject) => {
       this._requests[id] = {resolve, reject}
       window.postMessage(
@@ -74,6 +56,7 @@ window.nostr = {
 
 window.addEventListener('message', message => {
   if (
+    message.source !== window ||
     !message.data ||
     message.data.response === null ||
     message.data.response === undefined ||
@@ -89,20 +72,6 @@ window.addEventListener('message', message => {
   } else {
     window.nostr._requests[message.data.id].resolve(message.data.response)
   }
-
-  console.log(
-    '%c[nos2x:%c' +
-      message.data.id +
-      '%c]%c result: %c' +
-      JSON.stringify(
-        message?.data?.response || message?.data?.response?.error?.message || {}
-      ),
-    'background-color:#f1b912;font-weight:bold;color:white',
-    'background-color:#f1b912;font-weight:bold;color:#a92727',
-    'background-color:#f1b912;color:white;font-weight:bold',
-    'color:auto',
-    'font-weight:bold;color:#08589d'
-  )
 
   delete window.nostr._requests[message.data.id]
 })

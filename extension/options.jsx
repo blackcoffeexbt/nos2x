@@ -1,559 +1,406 @@
-import {bytesToHex, hexToBytes} from '@noble/hashes/utils'
-import {getPublicKey} from 'nostr-tools'
-import * as nip19 from 'nostr-tools/nip19'
-import {decrypt, encrypt} from 'nostr-tools/nip49'
-import {generateSecretKey} from 'nostr-tools/pure'
-import React, {useEffect, useState} from 'react'
+import React, {useCallback, useEffect, useRef, useState} from 'react'
 import {createRoot} from 'react-dom/client'
 import QRCode from 'react-qr-code'
 import browser from 'webextension-polyfill'
-import {removePermissions} from './common'
+import {manage, identityLabel} from './ui'
 
 function Options() {
-  let [unsavedChanges, setUnsavedChanges] = useState([])
-  let [privKey, setPrivKey] = useState(null)
-  let [privKeyInput, setPrivKeyInput] = useState('')
-  let [askPassword, setAskPassword] = useState(null)
-  let [password, setPassword] = useState('')
-  let [policies, setPermissions] = useState([])
-  let [protocolHandler, setProtocolHandler] = useState('https://njump.me/{raw}')
-  let [hidingPrivateKey, hidePrivateKey] = useState(true)
-  let [showNotifications, setNotifications] = useState(false)
-  let [messages, setMessages] = useState([])
-  let [handleNostrLinks, setHandleNostrLinks] = useState(false)
-  let [showProtocolHandlerHelp, setShowProtocolHandlerHelp] = useState(false)
-  let [selectedItems, setSelectedItems] = useState([])
-
-  const showMessage = msg => {
-    setMessages(oldMessages => [...oldMessages, msg])
+  const sensitiveGeneration = useRef(0)
+  const [state, setState] = useState(null)
+  const [selected, setSelected] = useState('')
+  const [name, setName] = useState('')
+  const [key, setKey] = useState('')
+  const [password, setPassword] = useState('')
+  const [exportPassword, setExportPassword] = useState('')
+  const [revealed, setRevealed] = useState('')
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [removing, setRemoving] = useState(false)
+  const [notifications, setNotifications] = useState(false)
+  const [handlerEnabled, setHandlerEnabled] = useState(false)
+  const [handler, setHandler] = useState('https://njump.me/{raw}')
+  const clearSensitive = useCallback(() => {
+    sensitiveGeneration.current++
+    setRevealed('')
+    setPassword('')
+    setExportPassword('')
+    setKey('')
+  }, [])
+  useEffect(() => {
+    if (!revealed) return
+    const timer = setTimeout(clearSensitive, 60000)
+    return () => clearTimeout(timer)
+  }, [revealed, clearSensitive])
+  const identity = state?.identities.find(item => item.id === selected)
+  const sites = Object.entries(state?.sites || {})
+    .filter(([, site]) => site.identityId === selected)
+    .map(([host]) => host)
+  async function refresh() {
+    const data = await manage('state')
+    setState(data)
+    return data
   }
-
   useEffect(() => {
-    if (messages.length === 0) {
-      return
-    }
-    const timeout = setTimeout(() => setMessages([]), 3000)
-    return () => clearTimeout(timeout)
-  }, [messages, setMessages])
-
-  useEffect(() => {
+    refresh().catch(e => setError(e.message))
     browser.storage.local
-      .get(['private_key', 'protocol_handler', 'notifications'])
-      .then(results => {
-        if (results.private_key) {
-          let prvKey = results.private_key
-          let nsec = nip19.nsecEncode(hexToBytes(prvKey))
-          setPrivKeyInput(nsec)
-          setPrivKey(nsec)
-        }
-        if (results.protocol_handler) {
-          setProtocolHandler(results.protocol_handler)
-          setHandleNostrLinks(true)
-          setShowProtocolHandlerHelp(false)
-        }
-        if (results.notifications) {
-          setNotifications(true)
-        }
+      .get(['notifications', 'protocol_handler'])
+      .then(data => {
+        setNotifications(!!data.notifications)
+        setHandlerEnabled(!!data.protocol_handler)
+        if (data.protocol_handler) setHandler(data.protocol_handler)
       })
-  }, [])
+      .catch(e => setError(e.message))
+    const clear = () => {
+      if (document.visibilityState === 'hidden') clearSensitive()
+    }
+    document.addEventListener('visibilitychange', clear)
+    window.addEventListener('blur', clearSensitive)
+    window.addEventListener('pagehide', clearSensitive)
+    return () => {
+      document.removeEventListener('visibilitychange', clear)
+      window.removeEventListener('blur', clearSensitive)
+      window.removeEventListener('pagehide', clearSensitive)
+    }
+  }, [clearSensitive])
 
-  useEffect(() => {
-    loadPermissions()
-  }, [])
-
-  async function loadPermissions() {
-    let {policies = {}} = await browser.storage.local.get('policies')
-    let list = []
-
-    Object.entries(policies).forEach(([host, accepts]) => {
-      Object.entries(accepts).forEach(([accept, types]) => {
-        Object.entries(types).forEach(([type, {conditions, created_at}]) => {
-          list.push({
-            host,
-            type,
-            accept,
-            conditions,
-            created_at
-          })
-        })
-      })
-    })
-
-    setPermissions(list)
+  function choose(id) {
+    setSelected(id)
+    setName(state.identities.find(item => item.id === id)?.name || '')
+    clearSensitive()
+    setRemoving(false)
+    setError('')
+    setMessage('')
   }
-
+  async function run(fn, success) {
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      await fn()
+      await refresh()
+      if (success) setMessage(success)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  async function add(generate) {
+    await run(async () => {
+      const id = await manage('add', {key, password, generate, name})
+      setSelected(id)
+      setRevealed('')
+      setKey('')
+      setPassword('')
+      setExportPassword('')
+      setRemoving(false)
+      const data = await refresh()
+      setName(data.identities.find(item => item.id === id).name)
+    }, 'Identity added')
+  }
+  const policies = Object.entries(state?.policies[selected] || {}).flatMap(
+    ([host, answers]) =>
+      Object.entries(answers).flatMap(([accept, rules]) =>
+        Object.entries(rules).map(([type, rule]) => ({
+          host,
+          accept,
+          type,
+          ...rule
+        }))
+      )
+  )
   return (
-    <>
-      <h1 style={{fontSize: '25px', marginBlockEnd: '0px'}}>nos2x</h1>
-      <p style={{marginBlockStart: '0px'}}>nostr signer extension</p>
-      <h2 style={{marginBlockStart: '20px', marginBlockEnd: '5px'}}>options</h2>
-      <div
-        style={{
-          marginBottom: '10px',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '10px',
-          width: 'fit-content'
-        }}
-      >
-        <div>
-          <div>private key:&nbsp;</div>
-          <div
-            style={{
-              marginLeft: '10px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '10px'
-            }}
+    <main className="options">
+      <h1>nos2x</h1>
+      <p>Nostr signer extension</p>
+      {error && <p role="alert">{error}</p>}
+      {message && <p role="status">{message}</p>}
+      <h2>Identities</h2>
+      {!state && !error && <p>Loading…</p>}
+      {state && (
+        <>
+          <select
+            aria-label="Manage identity"
+            value={selected}
+            disabled={busy}
+            onChange={e => choose(e.target.value)}
           >
-            <div style={{display: 'flex', gap: '10px'}}>
+            <option value="">Add an identity</option>
+            {state.identities.map(item => (
+              <option key={item.id} value={item.id}>
+                {identityLabel(item)}
+              </option>
+            ))}
+          </select>
+          <fieldset disabled={busy}>
+            <label>
+              Name
               <input
-                type={hidingPrivateKey ? 'password' : 'text'}
-                style={{width: '600px'}}
-                value={privKeyInput}
-                onChange={handleKeyChange}
+                value={name}
+                onChange={e => setName(e.target.value)}
+                placeholder="Optional identity name"
               />
-              {privKeyInput === '' && (
-                <button onClick={generate}>generate</button>
-              )}
-              {privKeyInput && hidingPrivateKey && (
-                <>
-                  {askPassword !== 'encrypt/display' && (
-                    <button onClick={() => hidePrivateKey(false)}>
-                      show key
+            </label>
+            {!identity ? (
+              <>
+                <label>
+                  Private key
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={key}
+                    onChange={e => setKey(e.target.value)}
+                    placeholder="nsec, hex, or ncryptsec"
+                  />
+                </label>
+                {key.trim().toLowerCase().startsWith('ncryptsec1') && (
+                  <label>
+                    Import password
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      value={password}
+                      onChange={e => setPassword(e.target.value)}
+                    />
+                  </label>
+                )}
+                <div className="actions">
+                  <button disabled={!key.trim()} onClick={() => add(false)}>
+                    Import identity
+                  </button>
+                  <button onClick={() => add(true)}>Generate identity</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <button
+                  disabled={!name.trim()}
+                  onClick={() =>
+                    run(
+                      () => manage('rename', {id: selected, name}),
+                      'Identity renamed'
+                    )
+                  }
+                >
+                  Save name
+                </button>
+                <p>Public key</p>
+                <pre className="key">{identity.npub}</pre>
+                <QRCode size={180} value={identity.npub.toUpperCase()} />
+                <p>
+                  <a
+                    href={`https://nosta.me/${identity.npub}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Browse profile
+                  </a>
+                  {' · '}
+                  <a
+                    href="https://nosta.me/login/options"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Edit profile
+                  </a>
+                </p>
+                <p>Assigned websites: {sites.join(', ') || 'none'}</p>
+                <h3>Reveal or export private key</h3>
+                <label>
+                  Export password (optional)
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={exportPassword}
+                    onChange={e => {
+                      setExportPassword(e.target.value)
+                      setRevealed('')
+                    }}
+                  />
+                </label>
+                <div className="actions">
+                  <button
+                    onClick={() =>
+                      run(async () => {
+                        const generation = sensitiveGeneration.current
+                        const result = await manage('export', {
+                          id: selected,
+                          password: exportPassword
+                        })
+                        if (
+                          generation === sensitiveGeneration.current &&
+                          document.visibilityState === 'visible' &&
+                          document.hasFocus()
+                        )
+                          setRevealed(result)
+                        setExportPassword('')
+                      })
+                    }
+                  >
+                    {exportPassword ? 'Show encrypted key' : 'Show private key'}
+                  </button>
+                  {revealed && (
+                    <button
+                      onClick={() => {
+                        clearSensitive()
+                      }}
+                    >
+                      Hide key
                     </button>
                   )}
-                  <button onClick={() => setAskPassword('encrypt/display')}>
-                    show key encrypted
-                  </button>
-                </>
-              )}
-
-              {privKeyInput && !hidingPrivateKey && (
-                <button onClick={hideAndResetKeyInput}>hide key</button>
-              )}
-            </div>
-            {privKeyInput &&
-              !privKeyInput.startsWith('ncryptsec1') &&
-              !isKeyValid() && (
-                <div style={{color: 'red'}}>private key is invalid!</div>
-              )}
-            {!hidingPrivateKey &&
-              privKeyInput !== '' &&
-              (privKeyInput.startsWith('ncryptsec1') || isKeyValid()) && (
-                <div
-                  style={{
-                    height: 'auto',
-                    maxWidth: 256,
-                    width: '100%',
-                    marginTop: '5px'
-                  }}
-                >
-                  <QRCode
-                    size={256}
-                    style={{height: 'auto', maxWidth: '100%', width: '100%'}}
-                    value={privKeyInput.toUpperCase()}
-                    viewBox={`0 0 256 256`}
-                  />
                 </div>
-              )}
-          </div>
-        </div>
-        {askPassword && (
-          <div>
-            <div>password:&nbsp;</div>
-            <div
-              style={{
-                marginLeft: '10px',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '10px'
-              }}
-            >
-              <form
-                style={{display: 'flex', flexDirection: 'row', gap: '10px'}}
-              >
-                <input
-                  autoFocus
-                  type="password"
-                  value={password}
-                  onChange={ev => setPassword(ev.target.value)}
-                  style={{width: '150px'}}
-                />
-                {askPassword === 'decrypt/save' ? (
+                {revealed && (
+                  <>
+                    <pre className="key">{revealed}</pre>
+                    <QRCode size={224} value={revealed.toUpperCase()} />
+                  </>
+                )}
+                <p>
                   <button
-                    onClick={decryptPrivateKeyAndSave}
-                    disabled={!password}
-                  >
-                    decrypt key
-                  </button>
-                ) : askPassword === 'encrypt/display' ? (
-                  <button
-                    onClick={ev => {
-                      console.log('gah')
-                      encryptPrivateKeyAndDisplay(ev)
+                    onClick={() => {
+                      setRemoving(true)
+                      setRevealed('')
+                      setExportPassword('')
                     }}
-                    disabled={!password}
                   >
-                    encrypt and show key
+                    Remove identity…
                   </button>
+                </p>
+                {removing && (
+                  <div role="alert" className="confirmation">
+                    <p>
+                      Remove {identityLabel(identity)} and its permissions?
+                      Affected websites: {sites.join(', ') || 'none'}. Back up
+                      the private key first. These websites will need another
+                      identity and a reload.
+                    </p>
+                    <button
+                      onClick={() =>
+                        run(async () => {
+                          await manage('remove', {id: selected})
+                          choose('')
+                        }, 'Identity removed')
+                      }
+                    >
+                      Confirm removal
+                    </button>
+                    <button onClick={() => setRemoving(false)}>Cancel</button>
+                  </div>
+                )}
+                <h3>Permissions for {identityLabel(identity)}</h3>
+                {!policies.length ? (
+                  <p>No saved permissions.</p>
                 ) : (
-                  'jaksbdkjsad'
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Website</th>
+                        <th>Operation</th>
+                        <th>Answer</th>
+                        <th>Conditions</th>
+                        <th>Since</th>
+                        <th>Revoke</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {policies.map(rule => (
+                        <tr key={`${rule.host}:${rule.accept}:${rule.type}`}>
+                          <td>{rule.host}</td>
+                          <td>{rule.type}</td>
+                          <td>{rule.accept === 'true' ? 'Allow' : 'Deny'}</td>
+                          <td>
+                            {rule.conditions.kinds
+                              ? `Kinds: ${Object.keys(
+                                  rule.conditions.kinds
+                                ).join(', ')}`
+                              : 'Always'}
+                          </td>
+                          <td>
+                            {new Date(rule.created_at * 1000).toLocaleString()}
+                          </td>
+                          <td>
+                            <button
+                              onClick={() =>
+                                run(
+                                  () =>
+                                    manage('revoke', {id: selected, ...rule}),
+                                  'Permission revoked'
+                                )
+                              }
+                            >
+                              Revoke
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 )}
-              </form>
-            </div>
-          </div>
-        )}
-        <div>
-          <div>nosta.me:&nbsp;</div>
-          <div
-            style={{
-              marginLeft: '10px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '10px'
-            }}
-          >
-            <div style={{display: 'flex', gap: '10px'}}>
-              <button
-                onClick={() => {
-                  let {data} = nip19.decode(privKey)
-                  let pub = getPublicKey(data)
-                  let npub = nip19.npubEncode(pub)
-                  window.open('https://nosta.me/' + npub)
-                }}
-                style={{cursor: 'pointer'}}
-              >
-                browse your profile
-              </button>
-              <button
-                onClick={() => window.open('https://nosta.me/login/options')}
-                style={{cursor: 'pointer'}}
-              >
-                edit your profile
-              </button>
-            </div>
-          </div>
-        </div>
-        <div>
-          <label style={{display: 'flex', alignItems: 'center'}}>
-            <div>
-              handle{' '}
-              <span style={{padding: '2px', background: 'silver'}}>nostr:</span>{' '}
-              links:
-            </div>
-            <input
-              type="checkbox"
-              checked={handleNostrLinks}
-              onChange={changeHandleNostrLinks}
-            />
-          </label>
-          <div style={{marginLeft: '10px'}}>
-            {handleNostrLinks && (
-              <div>
-                <div style={{display: 'flex'}}>
-                  <input
-                    placeholder="url template"
-                    value={protocolHandler}
-                    onChange={handleChangeProtocolHandler}
-                    style={{width: '680px', maxWidth: '90%'}}
-                  />
-                  {!showProtocolHandlerHelp && (
-                    <button onClick={changeShowProtocolHandlerHelp}>?</button>
-                  )}
-                </div>
-                {showProtocolHandlerHelp && (
-                  <pre>{`
-    {raw} = anything after the colon, i.e. the full nip19 bech32 string
-    {hex} = hex pubkey for npub or nprofile, hex event id for note or nevent
-    {p_or_e} = "p" for npub or nprofile, "e" for note or nevent
-    {u_or_n} = "u" for npub or nprofile, "n" for note or nevent
-    {relay0} = first relay in a nprofile or nevent
-    {relay1} = second relay in a nprofile or nevent
-    {relay2} = third relay in a nprofile or nevent
-    {hrp} = human-readable prefix of the nip19 string
-
-    examples:
-      - https://njump.me/{raw}
-      - https://snort.social/{raw}
-      - https://nostr.band/{raw}
-                `}</pre>
-                )}
-              </div>
+              </>
             )}
-          </div>
-        </div>
-        <label style={{display: 'flex', alignItems: 'center'}}>
-          show notifications when permissions are used:
+          </fieldset>
+        </>
+      )}
+      <h2>General settings</h2>
+      <fieldset disabled={busy}>
+        <label className="checkbox">
           <input
             type="checkbox"
-            checked={showNotifications}
-            onChange={handleNotifications}
+            checked={handlerEnabled}
+            onChange={e => setHandlerEnabled(e.target.checked)}
           />
+          Handle nostr: links
+        </label>
+        {handlerEnabled && (
+          <>
+            <label>
+              URL template
+              <input
+                value={handler}
+                onChange={e => setHandler(e.target.value)}
+              />
+            </label>
+            <p>
+              Available placeholders:{' '}
+              {
+                '{raw}, {hex}, {hrp}, {p_or_e}, {u_or_n}, {relay0}, {relay1}, {relay2}'
+              }
+              . Example: {'https://njump.me/{raw}'}
+            </p>
+          </>
+        )}
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            checked={notifications}
+            onChange={e => setNotifications(e.target.checked)}
+          />
+          Show notifications when permissions are used
         </label>
         <button
-          disabled={!unsavedChanges.length}
-          onClick={saveChanges}
-          style={{padding: '5px 20px'}}
+          onClick={() =>
+            run(async () => {
+              if (
+                notifications &&
+                !(await browser.permissions.request({
+                  permissions: ['notifications']
+                }))
+              ) {
+                setNotifications(false)
+                throw new Error('Notification permission was not granted')
+              }
+              await browser.storage.local.set({
+                notifications,
+                protocol_handler: handlerEnabled ? handler : ''
+              })
+            }, 'General settings saved')
+          }
         >
-          save
+          Save settings
         </button>
-        <div style={{fontSize: '120%'}}>
-          {messages.map((message, i) => (
-            <div key={i}>{message}</div>
-          ))}
-        </div>
-      </div>
-      <div>
-        <h2>permissions</h2>
-        {!!policies.length && (
-          <div style={{display: 'flex'}}>
-            <table>
-              <thead>
-                <tr>
-                  <th>domain</th>
-                  <th>permission</th>
-                  <th>answer</th>
-                  <th>conditions</th>
-                  <th>since</th>
-                  <th>revoke</th>
-                </tr>
-              </thead>
-              <tbody>
-                {policies.map(
-                  ({host, type, accept, conditions, created_at}, index) => (
-                    <tr key={host + type + accept + JSON.stringify(conditions)}>
-                      <td>{host}</td>
-                      <td>{type}</td>
-                      <td>{accept === 'true' ? 'allow' : 'deny'}</td>
-                      <td>
-                        {conditions.kinds
-                          ? `kinds: ${Object.keys(conditions.kinds).join(', ')}`
-                          : 'always'}
-                      </td>
-                      <td>
-                        {new Date(created_at * 1000)
-                          .toISOString()
-                          .split('.')[0]
-                          .split('T')
-                          .join(' ')}
-                      </td>
-                      <td>
-                        <input
-                          type="checkbox"
-                          checked={selectedItems.includes(index)}
-                          onChange={() => handleSelect(index)}
-                          data-host={host}
-                          data-accept={accept}
-                          data-type={type}
-                        />
-                      </td>
-                    </tr>
-                  )
-                )}
-              </tbody>
-            </table>
-            {selectedItems.length > 0 ? (
-              <button
-                style={{marginLeft: '0.5rem'}}
-                onClick={handleMultiRevoke}
-              >
-                revoke
-              </button>
-            ) : null}
-          </div>
-        )}
-        {!policies.length && (
-          <div style={{marginTop: '5px'}}>
-            no permissions have been granted yet
-          </div>
-        )}
-      </div>
-    </>
+      </fieldset>
+    </main>
   )
-
-  async function hideAndResetKeyInput() {
-    setPrivKeyInput(privKey)
-    hidePrivateKey(true)
-  }
-
-  async function handleKeyChange(e) {
-    let key = e.target.value.toLowerCase().trim()
-    setPrivKeyInput(key)
-
-    try {
-      let bytes = hexToBytes(key)
-      if (bytes.length === 32) {
-        key = nip19.nsecEncode(bytes)
-        setPrivKeyInput(key)
-      }
-    } catch (err) {
-      /***/
-    }
-
-    if (key.startsWith('ncryptsec1')) {
-      // we won't save an encrypted key, will wait for the password
-      setAskPassword('decrypt/save')
-      return
-    }
-
-    try {
-      // we will only save a key that is a valid nsec
-      if (nip19.decode(key).type === 'nsec') {
-        addUnsavedChanges('private_key')
-      }
-    } catch (err) {
-      /***/
-    }
-  }
-
-  async function generate() {
-    setPrivKeyInput(nip19.nsecEncode(generateSecretKey()))
-    addUnsavedChanges('private_key')
-  }
-
-  function encryptPrivateKeyAndDisplay(ev) {
-    ev.preventDefault()
-
-    try {
-      let {data} = nip19.decode(privKeyInput)
-      let encrypted = encrypt(data, password, 16, 0x00)
-      setPrivKeyInput(encrypted)
-      hidePrivateKey(false)
-      setAskPassword(null)
-    } catch (e) {
-      showMessage(e.message)
-    }
-  }
-
-  function decryptPrivateKeyAndSave(ev) {
-    ev.preventDefault()
-
-    try {
-      let decrypted = decrypt(privKeyInput, password)
-      setPrivKeyInput(nip19.nsecEncode(decrypted))
-      browser.storage.local.set({
-        private_key: bytesToHex(decrypted)
-      })
-
-      setTimeout(() => {
-        setAskPassword(null)
-      }, 2000)
-    } catch (e) {
-      showMessage(e.message)
-    }
-  }
-
-  async function saveKey() {
-    if (!isKeyValid()) {
-      showMessage('PRIVATE KEY IS INVALID! did not save private key.')
-      return
-    }
-    let hexOrEmptyKey = privKeyInput
-    try {
-      let {type, data} = nip19.decode(privKeyInput)
-      if (type === 'nsec') hexOrEmptyKey = bytesToHex(data)
-    } catch (_) {}
-    await browser.storage.local.set({
-      private_key: hexOrEmptyKey
-    })
-    if (hexOrEmptyKey !== '') {
-      setPrivKeyInput(nip19.nsecEncode(hexToBytes(hexOrEmptyKey)))
-    }
-    showMessage('saved private key!')
-  }
-
-  function isKeyValid() {
-    if (privKeyInput === '') return true
-    try {
-      if (nip19.decode(privKeyInput).type === 'nsec') return true
-    } catch (_) {}
-    return false
-  }
-
-  async function handleSelect(index) {
-    if (selectedItems.includes(index)) {
-      setSelectedItems(selectedItems.filter(i => i !== index))
-    } else {
-      setSelectedItems([...selectedItems, index])
-    }
-  }
-
-  function handleNotifications() {
-    setNotifications(!showNotifications)
-    addUnsavedChanges('notifications')
-    if (!showNotifications) requestBrowserNotificationPermissions()
-  }
-
-  async function handleMultiRevoke() {
-    for (let index of selectedItems) {
-      let {host, accept, type} = policies[index]
-      await removePermissions(host, accept, type)
-    }
-
-    showMessage('removed selected policies')
-    loadPermissions()
-    setSelectedItems([])
-  }
-
-  async function requestBrowserNotificationPermissions() {
-    let granted = await browser.permissions.request({
-      permissions: ['notifications']
-    })
-    if (!granted) setNotifications(false)
-  }
-
-  async function saveNotifications() {
-    await browser.storage.local.set({notifications: showNotifications})
-    showMessage('saved notifications!')
-  }
-
-  function changeShowProtocolHandlerHelp() {
-    setShowProtocolHandlerHelp(true)
-  }
-
-  function changeHandleNostrLinks() {
-    if (handleNostrLinks) {
-      setProtocolHandler('')
-      addUnsavedChanges('protocol_handler')
-    } else setShowProtocolHandlerHelp(true)
-    setHandleNostrLinks(!handleNostrLinks)
-  }
-
-  function handleChangeProtocolHandler(e) {
-    setProtocolHandler(e.target.value)
-    addUnsavedChanges('protocol_handler')
-  }
-
-  async function saveNostrProtocolHandlerSettings() {
-    await browser.storage.local.set({protocol_handler: protocolHandler})
-    showMessage('saved protocol handler!')
-  }
-
-  function addUnsavedChanges(section) {
-    setUnsavedChanges(currentUnsavedChanges =>
-      currentUnsavedChanges.includes(section)
-        ? currentUnsavedChanges
-        : [...currentUnsavedChanges, section]
-    )
-  }
-
-  async function saveChanges() {
-    for (let section of unsavedChanges) {
-      switch (section) {
-        case 'private_key':
-          await saveKey()
-          break
-        case 'protocol_handler':
-          await saveNostrProtocolHandlerSettings()
-          break
-        case 'notifications':
-          await saveNotifications()
-          break
-      }
-    }
-    setUnsavedChanges([])
-  }
 }
-
 createRoot(document.getElementById('main')).render(<Options />)

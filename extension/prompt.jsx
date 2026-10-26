@@ -1,144 +1,153 @@
 import browser from 'webextension-polyfill'
 import {createRoot} from 'react-dom/client'
-import React from 'react'
-
+import React, {useEffect, useState} from 'react'
 import {PERMISSION_NAMES} from './common'
+import {send, identityLabel} from './ui'
 
-function Prompt() {
-  let qs = new URLSearchParams(location.search)
-  let id = qs.get('id')
-  let host = qs.get('host')
-  let type = qs.get('type')
-  let result = qs.get('result')
-  let params, event
-  try {
-    params = JSON.parse(qs.get('params'))
-    if (Object.keys(params).length === 0) params = null
-    else if (params.event) event = params.event
-  } catch (err) {
-    params = null
-  }
-
-  return (
-    <>
-      <b style={{display: 'block', textAlign: 'center', fontSize: '200%'}}>
-        {host}
-      </b>{' '}
-      <p style={{margin: 0}}>
-        is requesting your permission to <b>{PERMISSION_NAMES[type]}:</b>
-      </p>
-      {params && (
-        <div style={{width: '100%', maxHeight: '200px', overflowY: 'scroll'}}>
-          <p style={{margin: 0}}>now acting on</p>
-          <pre
-            style={{
-              width: '100%',
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-all'
-            }}
-          >
-            <code>{JSON.stringify(event || params, null, 2)}</code>
-          </pre>
-        </div>
-      )}
-      {result && (
-        <div style={{width: '100%', maxHeight: '180px', overflowY: 'scroll'}}>
-          <p style={{margin: 0}}>result:</p>
-          <pre
-            style={{
-              width: '100%',
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-all'
-            }}
-          >
-            <code>{result}</code>
-          </pre>
-        </div>
-      )}
-      <div>
-        <div
-          style={{
-            display: 'flex',
-            justifyContent: 'space-around',
-            gap: '0.5rem'
-          }}
-        >
-          {event?.kind === undefined && (
-            <button
-              style={{marginTop: '5px'}}
-              onClick={authorizeHandler(
-                true,
-                {} // store this and answer true forever
-              )}
-            >
-              authorize forever
-            </button>
-          )}
-          {event?.kind !== undefined && (
-            <button
-              style={{marginTop: '5px'}}
-              onClick={authorizeHandler(
-                true,
-                {kinds: {[event.kind]: true}} // store and always answer true for all events that match this condition
-              )}
-            >
-              authorize kind {event.kind} forever
-            </button>
-          )}
-          <button style={{marginTop: '5px'}} onClick={authorizeHandler(true)}>
-            authorize just this
-          </button>
-        </div>
-        <div
-          style={{
-            marginTop: '0.5rem',
-            display: 'flex',
-            justifyContent: 'space-around',
-            gap: '0.5rem'
-          }}
-        >
-          {event?.kind !== undefined ? (
-            <button
-              style={{marginTop: '5px'}}
-              onClick={authorizeHandler(
-                false,
-                {kinds: {[event.kind]: true}} // idem
-              )}
-            >
-              reject kind {event.kind} forever
-            </button>
-          ) : (
-            <button
-              style={{marginTop: '5px'}}
-              onClick={authorizeHandler(
-                false,
-                {} // idem
-              )}
-            >
-              reject forever
-            </button>
-          )}
-          <button style={{marginTop: '5px'}} onClick={authorizeHandler(false)}>
-            reject
-          </button>
-        </div>
-      </div>
-    </>
-  )
-
-  function authorizeHandler(accept, conditions) {
-    return function (ev) {
-      ev.preventDefault()
-      browser.runtime.sendMessage({
-        prompt: true,
-        id,
-        host,
-        type,
-        accept,
-        conditions
-      })
-    }
-  }
+const id = new URLSearchParams(location.search).get('id')
+async function prompt(action, args = {}) {
+  const window = await browser.windows.getCurrent()
+  return send({channel: 'prompt', id, action, windowId: window.id, ...args})
 }
 
+function Prompt() {
+  const [request, setRequest] = useState(null)
+  const [identityId, setIdentityId] = useState('')
+  const [preview, setPreview] = useState(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [loadingPreview, setLoadingPreview] = useState(false)
+  useEffect(() => {
+    prompt('get')
+      .then(data => {
+        setRequest(data)
+        setIdentityId(
+          data.assignedId ||
+            (data.identities.length === 1 ? data.identities[0].id : '')
+        )
+      })
+      .catch(e => setError(e.message))
+  }, [])
+  useEffect(() => {
+    let active = true
+    setPreview(null)
+    if (!identityId || !request) return
+    setLoadingPreview(true)
+    setError('')
+    prompt('preview', {identityId})
+      .then(result => {
+        if (active) setPreview(result)
+      })
+      .catch(e => {
+        if (active) setError(e.message)
+      })
+      .finally(() => {
+        if (active) setLoadingPreview(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [identityId, request])
+  useEffect(() => {
+    if (!request) return
+    // Keep the worker alive while an approval is visible, up to its expiry.
+    const timer = setInterval(() => {
+      prompt('ping').catch(e => {
+        setError(e.message)
+        clearInterval(timer)
+      })
+    }, 20000)
+    return () => clearInterval(timer)
+  }, [request])
+  async function answer(accept, remember) {
+    setBusy(true)
+    setError('')
+    try {
+      await prompt('answer', {
+        identityId,
+        accept,
+        conditions: remember ? {} : undefined
+      })
+    } catch (e) {
+      setError(e.message)
+      setBusy(false)
+    }
+  }
+  const event = request?.params?.event
+  return (
+    <div className="approval">
+      <h2>{request?.host || 'nos2x'}</h2>
+      {error && <p role="alert">{error}</p>}
+      {request && (
+        <>
+          <p>
+            Requests permission to <b>{PERMISSION_NAMES[request.type]}</b>.
+          </p>
+          <label>
+            Identity
+            <select
+              value={identityId}
+              disabled={!!request.assignedId || busy}
+              onChange={e => setIdentityId(e.target.value)}
+            >
+              <option value="" disabled>
+                Choose an identity
+              </option>
+              {request.identities.map(identity => (
+                <option key={identity.id} value={identity.id}>
+                  {identityLabel(identity)}
+                </option>
+              ))}
+            </select>
+          </label>
+          {!request.assignedId && (
+            <p>
+              Your choice will be remembered for this website when you approve.
+            </p>
+          )}
+          {!!Object.keys(request.params || {}).length && (
+            <>
+              <p>Request</p>
+              <pre className="request-data">
+                {JSON.stringify(event || request.params, null, 2)}
+              </pre>
+            </>
+          )}
+          {loadingPreview && <p>Preparing preview…</p>}
+          {preview !== null && (
+            <>
+              <p>Result for this identity</p>
+              <pre className="request-data">{preview}</pre>
+            </>
+          )}
+          <div className="actions">
+            <button
+              disabled={busy || !identityId || loadingPreview || !!error}
+              onClick={() => answer(true, false)}
+            >
+              Authorize once
+            </button>
+            <button
+              disabled={busy || !identityId || loadingPreview || !!error}
+              onClick={() => answer(true, true)}
+            >
+              {event
+                ? `Authorize kind ${event.kind} forever`
+                : 'Authorize forever'}
+            </button>
+            <button disabled={busy} onClick={() => answer(false, false)}>
+              Reject
+            </button>
+            <button
+              disabled={busy || !identityId}
+              onClick={() => answer(false, true)}
+            >
+              {event ? `Reject kind ${event.kind} forever` : 'Reject forever'}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
 createRoot(document.getElementById('main')).render(<Prompt />)
