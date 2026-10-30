@@ -8,4 +8,6 @@ export async function send(message) {
 
 export const manage = (action, args) => send({channel: 'manage', action, args})
 export const identityLabel = identity =>
-  `${identity.name} (${identity.npub.slice(0, 16)}…)`
+  `${identity.name}${
+    identity.type === 'remote' ? ' · Remote' : ''
+  } (${identity.npub.slice(0, 16)}…)`

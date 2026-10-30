@@ -8,6 +8,7 @@ esbuild
   .build({
     bundle: true,
     entryPoints: {
+      'remote.build': './extension/remote-ui.jsx',
       'popup.build': './extension/popup.jsx',
       'styles.build': './extension/styles.css',
       'prompt.build': './extension/prompt.jsx',

@@ -1,6 +1,7 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react'
 import {createRoot} from 'react-dom/client'
 import QRCode from 'react-qr-code'
+import {Pairing} from './pairing'
 import browser from 'webextension-polyfill'
 import {manage, identityLabel} from './ui'
 
@@ -144,6 +145,16 @@ function Options() {
             </label>
             {!identity ? (
               <>
+                <Pairing
+                  onPaired={async id => {
+                    const data = await refresh()
+                    setSelected(id)
+                    setName(
+                      data.identities.find(item => item.id === id)?.name || ''
+                    )
+                    setMessage('Remote signer connected')
+                  }}
+                />
                 <label>
                   Private key
                   <input
@@ -206,54 +217,65 @@ function Options() {
                   </a>
                 </p>
                 <p>Assigned websites: {sites.join(', ') || 'none'}</p>
-                <h3>Reveal or export private key</h3>
-                <label>
-                  Export password (optional)
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    value={exportPassword}
-                    onChange={e => {
-                      setExportPassword(e.target.value)
-                      setRevealed('')
-                    }}
-                  />
-                </label>
-                <div className="actions">
-                  <button
-                    onClick={() =>
-                      run(async () => {
-                        const generation = sensitiveGeneration.current
-                        const result = await manage('export', {
-                          id: selected,
-                          password: exportPassword
-                        })
-                        if (
-                          generation === sensitiveGeneration.current &&
-                          document.visibilityState === 'visible' &&
-                          document.hasFocus()
-                        )
-                          setRevealed(result)
-                        setExportPassword('')
-                      })
-                    }
-                  >
-                    {exportPassword ? 'Show encrypted key' : 'Show private key'}
-                  </button>
-                  {revealed && (
-                    <button
-                      onClick={() => {
-                        clearSensitive()
-                      }}
-                    >
-                      Hide key
-                    </button>
-                  )}
-                </div>
-                {revealed && (
+                {identity.type === 'remote' ? (
+                  <p>
+                    Remote signer · Relays: {identity.relays.join(', ')}. Your
+                    private key stays on the signing device.
+                  </p>
+                ) : (
                   <>
-                    <pre className="key">{revealed}</pre>
-                    <QRCode size={224} value={revealed.toUpperCase()} />
+                    <h3>Reveal or export private key</h3>
+                    <label>
+                      Export password (optional)
+                      <input
+                        type="password"
+                        autoComplete="off"
+                        value={exportPassword}
+                        onChange={e => {
+                          setExportPassword(e.target.value)
+                          setRevealed('')
+                        }}
+                      />
+                    </label>
+                    <div className="actions">
+                      <button
+                        onClick={() =>
+                          run(async () => {
+                            const generation = sensitiveGeneration.current
+                            const result = await manage('export', {
+                              id: selected,
+                              password: exportPassword
+                            })
+                            if (
+                              generation === sensitiveGeneration.current &&
+                              document.visibilityState === 'visible' &&
+                              document.hasFocus()
+                            )
+                              setRevealed(result)
+                            setExportPassword('')
+                          })
+                        }
+                      >
+                        {exportPassword
+                          ? 'Show encrypted key'
+                          : 'Show private key'}
+                      </button>
+                      {revealed && (
+                        <button
+                          onClick={() => {
+                            clearSensitive()
+                          }}
+                        >
+                          Hide key
+                        </button>
+                      )}
+                    </div>
+                    {revealed && (
+                      <>
+                        <pre className="key">{revealed}</pre>
+                        <QRCode size={224} value={revealed.toUpperCase()} />
+                      </>
+                    )}
                   </>
                 )}
                 <p>
@@ -271,9 +293,11 @@ function Options() {
                   <div role="alert" className="confirmation">
                     <p>
                       Remove {identityLabel(identity)} and its permissions?
-                      Affected websites: {sites.join(', ') || 'none'}. Back up
-                      the private key first. These websites will need another
-                      identity and a reload.
+                      Affected websites: {sites.join(', ') || 'none'}.{' '}
+                      {identity.type === 'remote'
+                        ? 'This removes the pairing from this browser.'
+                        : 'Back up the private key first.'}{' '}
+                      These websites will need another identity and a reload.
                     </p>
                     <button
                       onClick={() =>

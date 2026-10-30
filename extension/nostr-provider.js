@@ -40,7 +40,14 @@ window.nostr = {
   _call(type, params) {
     let id = crypto.randomUUID()
     return new Promise((resolve, reject) => {
-      this._requests[id] = {resolve, reject}
+      const timer = setTimeout(() => {
+        if (!this._requests[id]) return
+        delete this._requests[id]
+        reject(
+          new Error('nos2x: Request expired; check the extension and try again')
+        )
+      }, 600000)
+      this._requests[id] = {resolve, reject, timer}
       window.postMessage(
         {
           id,
@@ -65,6 +72,7 @@ window.addEventListener('message', message => {
   )
     return
 
+  clearTimeout(window.nostr._requests[message.data.id].timer)
   if (message.data.response.error) {
     let error = new Error('nos2x: ' + message.data.response.error.message)
     error.stack = message.data.response.error.stack

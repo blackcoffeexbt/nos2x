@@ -112,3 +112,43 @@ permissions, concurrent requests, approval validation, identity switching, and
 NIP-04/NIP-44 isolation. Load `extension/` unpacked in Chromium to check the actual
 options, approval, and toolbar popup screens. Generated build files are ignored
 by Git and must be rebuilt after source changes.
+
+## Remote signing (NIP-46)
+
+In **Manage identities**, choose **Add an identity → Connect remote signer**.
+You can either display a pairing QR for your signing device to scan, or choose
+**Scan device QR** to scan a `bunker://` code displayed by the device. You can
+also paste the bunker connection string. Camera access is requested only when
+you start scanning; denied or unavailable cameras do not prevent pasting a code.
+
+The displayed QR uses `wss://relay.nostr.com` by default. Edit the relay list
+before generating it if your device uses other relays. A bunker connection uses
+the relays contained in its code. Both sides must be able to reach a shared
+relay. Pairing expires after four minutes; keep the options page open until it
+finishes. Cancelled or expired codes must be replaced with a new pairing code.
+Treat pairing codes as temporary connection credentials and do not share them.
+
+After pairing, select the remote identity for a website in the usual identity
+selector or approval window. nos2x retains its website and event-kind permission
+checks. Signing and NIP-04/NIP-44 encryption and decryption are then performed
+by the remote device. Normal remote requests run quietly in the background.
+An authentication window opens only if the signer requires an external login;
+closing that window cancels the request. Requests expire after four
+minutes. No local key is substituted if the device is unavailable. Encryption
+and decryption previews are omitted for remote identities to avoid requesting
+operations before you approve them.
+
+Pairings survive browser restarts. nos2x stores a separate communication key,
+the device's communication public key, your user public key, and pairing relays;
+it never imports the remote identity's private key. Devices may update their
+relay list. Removing a remote identity deletes its local pairing credentials,
+permissions, and website assignments, and attempts to notify the device with
+`logout`. You can pair again later with a new code. Existing local identities
+remain available; adding the same user public key twice is rejected.
+
+Remote signing requires Chromium 116 or newer and a signer implementing current
+NIP-46 with NIP-44 transport encryption. Device support for individual signing
+and encryption methods varies; unsupported methods fail without a local fallback.
+Legacy NIP-04 transport, NIP-05 login, and automatic signer discovery are not
+supported. NIP-04 message encryption remains available through supporting remote
+signers.

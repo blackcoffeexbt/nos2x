@@ -1,4 +1,5 @@
 import {SafeError} from './errors'
+import {isPublicKey, relayURLs} from './remote'
 import {Mutex} from 'async-mutex'
 import {bytesToHex, hexToBytes} from '@noble/hashes/utils.js'
 import {generateSecretKey, getPublicKey} from 'nostr-tools/pure'
@@ -8,6 +9,17 @@ import {decrypt, encrypt} from 'nostr-tools/nip49'
 export const STORAGE_KEY = 'identityStore'
 export const RELOAD_ERROR = 'Identity changed; reload this page'
 const copy = value => JSON.parse(JSON.stringify(value))
+// Chrome storage may reorder object properties when serializing records.
+const canonical = value =>
+  JSON.stringify(value, (_, item) =>
+    item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.keys(item)
+            .sort()
+            .map(key => [key, item[key]])
+        )
+      : item
+  )
 
 export function parseSecret(input, password = '') {
   try {
@@ -38,7 +50,7 @@ function validate(record) {
   const isMap = value =>
     value && typeof value === 'object' && !Array.isArray(value)
   if (
-    record?.version !== 1 ||
+    ![1, 2].includes(record?.version) ||
     !isMap(record.identities) ||
     !isMap(record.sites) ||
     !isMap(record.policies)
@@ -52,10 +64,19 @@ function validate(record) {
   Object.setPrototypeOf(record.sites, null)
   Object.setPrototypeOf(record.policies, null)
   for (const [id, identity] of Object.entries(record.identities)) {
-    if (
-      parseSecret(identity.privateKey).id !== id ||
-      typeof identity.name !== 'string'
-    ) {
+    const valid =
+      identity?.type === 'remote'
+        ? record.version === 2 &&
+          isPublicKey(id) &&
+          identity.userPubkey === id &&
+          isPublicKey(identity.signerPubkey) &&
+          isPublicKey(identity.clientKey) &&
+          !!parseSecret(identity.clientKey) &&
+          !!relayURLs(identity.relays) &&
+          identity.privateKey === undefined
+        : [undefined, 'local'].includes(identity?.type) &&
+          parseSecret(identity?.privateKey).id === id
+    if (!valid || typeof identity.name !== 'string') {
       throw new SafeError(
         'Invalid identity storage. Your data has not been removed.'
       )
@@ -104,6 +125,8 @@ export function publicState(state) {
     identities: Object.entries(state.identities).map(([id, identity]) => ({
       id,
       name: identity.name,
+      type: identity.type || 'local',
+      ...(identity.type === 'remote' ? {relays: identity.relays} : {}),
       npub: nip19.npubEncode(id)
     })),
     sites: copy(state.sites),
@@ -180,8 +203,8 @@ export class IdentityStore {
         const legacy = parseSecret(data.private_key)
         if (
           state.identities[legacy.id]?.privateKey !== legacy.privateKey ||
-          JSON.stringify(state.policies[legacy.id] || {}) !==
-            JSON.stringify(data.policies || {}) ||
+          canonical(state.policies[legacy.id] || {}) !==
+            canonical(data.policies || {}) ||
           Object.keys(data.policies || {}).some(
             host => state.sites[host]?.identityId !== legacy.id
           )
@@ -192,10 +215,16 @@ export class IdentityStore {
         }
         await this.storage.remove(['private_key', 'policies'])
       }
+      if (state.version === 1) {
+        state.version = 2
+        for (const identity of Object.values(state.identities))
+          identity.type = 'local'
+        await this.storage.set({[STORAGE_KEY]: state})
+      }
       return state
     }
     const state = {
-      version: 1,
+      version: 2,
       identities: Object.create(null),
       sites: Object.create(null),
       policies: Object.create(null)
@@ -210,6 +239,7 @@ export class IdentityStore {
         )
       }
       state.identities[legacy.id] = {
+        type: 'local',
         name: 'Identity 1',
         privateKey: legacy.privateKey
       }
@@ -225,7 +255,7 @@ export class IdentityStore {
     validate(state)
     await this.storage.set({[STORAGE_KEY]: state})
     const saved = (await this.storage.get(STORAGE_KEY))[STORAGE_KEY]
-    if (JSON.stringify(validate(saved)) !== JSON.stringify(state))
+    if (canonical(validate(saved)) !== canonical(state))
       throw new SafeError(
         'Could not verify migration; legacy data was preserved'
       )
@@ -247,12 +277,33 @@ export class IdentityStore {
     })
   }
 
+  async addRemote(id, credentials, name, signal) {
+    return this.mutate(state => {
+      if (signal?.aborted) throw new SafeError('Pairing cancelled or expired')
+      if (state.identities[id])
+        throw new SafeError('This identity has already been added')
+      state.identities[id] = {
+        type: 'remote',
+        name: name?.trim() || 'Remote signer',
+        userPubkey: id,
+        clientKey: credentials.clientKey,
+        signerPubkey: credentials.signerPubkey,
+        relays: credentials.relays
+      }
+      return id
+    })
+  }
+
   async manage(action, args = {}) {
     if (action === 'state') return this.read(publicState)
     if (action === 'export')
       return this.read(state => {
         const identity = state.identities[args.id]
         if (!identity) throw new SafeError('Identity not found')
+        if (identity.type === 'remote')
+          throw new SafeError(
+            'Remote identity private keys stay on the signing device'
+          )
         const secret = hexToBytes(identity.privateKey)
         return args.password
           ? encrypt(secret, args.password, 16, 0x00)
@@ -274,6 +325,7 @@ export class IdentityStore {
           )
             number++
           state.identities[identity.id] = {
+            type: 'local',
             privateKey: identity.privateKey,
             name: args.name?.trim() || `Identity ${number}`
           }

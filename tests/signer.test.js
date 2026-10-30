@@ -1,7 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import {readFileSync} from 'node:fs'
+import {runInNewContext} from 'node:vm'
 import {hexToBytes} from '@noble/hashes/utils.js'
-import {getPublicKey, verifyEvent} from 'nostr-tools/pure'
+import {getPublicKey, verifyEvent, finalizeEvent} from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import {encrypt} from 'nostr-tools/nip49'
 import * as nip04 from 'nostr-tools/nip04'
@@ -15,6 +17,14 @@ import {
   RELOAD_ERROR
 } from '../extension/identities'
 import {createSigner} from '../extension/signer'
+import {
+  RemoteSession,
+  remoteOperation,
+  newPairing,
+  bunkerPointer,
+  relayURLs,
+  DEFAULT_RELAY
+} from '../extension/remote'
 
 const keyA = '01'.repeat(32)
 const keyB = '02'.repeat(32)
@@ -53,7 +63,7 @@ function memory(initial = {}) {
     }
   }
 }
-function mock(initial) {
+function mock(initial, dependencies = {}) {
   let nextWindow = 100
   const windows = new Map()
   const api = {
@@ -78,7 +88,7 @@ function mock(initial) {
     tabs: {},
     notifications: {async create() {}}
   }
-  let signer = createSigner(api)
+  let signer = createSigner(api, dependencies)
   const ui = {id: api.runtime.id, url: api.runtime.getURL('options.html')}
   return {
     api,
@@ -88,7 +98,7 @@ function mock(initial) {
       return signer
     },
     restart() {
-      signer = createSigner(api)
+      signer = createSigner(api, dependencies)
     },
     async manage(action, args) {
       const response = await signer.handle(
@@ -858,4 +868,770 @@ test('normal responses, notifications, and approval URLs do not contain stored p
     assert.ok(!serialized.includes(key))
     assert.ok(!serialized.includes(nip19.nsecEncode(hexToBytes(key))))
   }
+})
+
+// A controllable relay/signer: transport envelopes and RPC results use real
+// signatures and NIP-44 encryption, without external network dependencies.
+class RemoteNetwork {
+  constructor() {
+    this.subscriptions = new Set()
+    this.requests = []
+    this.pools = []
+    this.auto = true
+    this.holdMethods = new Set()
+    this.failOpen = false
+    this.failPublish = false
+    this.switchTo = null
+    this.transform = event => event
+    this.sessionFactory = (credentials, options) => {
+      const pool = this.pool()
+      return new RemoteSession(credentials, {...options, pool})
+    }
+  }
+  pool() {
+    const subscriptions = []
+    const network = this
+    const pool = {
+      destroyed: false,
+      async ensureRelay(url) {
+        if (network.failOpen)
+          throw new Error('Network failure with secret payload')
+        return {
+          subscribe(filters, handlers) {
+            const sub = {
+              filters,
+              handlers,
+              close() {
+                network.subscriptions.delete(sub)
+                handlers.onclose?.()
+              }
+            }
+            subscriptions.push(sub)
+            network.subscriptions.add(sub)
+            return sub
+          },
+          async publish(envelope) {
+            if (network.failPublish)
+              throw new Error('Publish failed with secret payload')
+            assert.ok(verifyEvent(envelope))
+            const key = nip44.v2.utils.getConversationKey(
+              hexToBytes(keyB),
+              envelope.pubkey
+            )
+            const rpc = JSON.parse(nip44.v2.decrypt(envelope.content, key))
+            const request = {...rpc, client: envelope.pubkey, relay: url}
+            network.requests.push(request)
+            if (network.auto && !network.holdMethods.has(rpc.method))
+              setImmediate(async () => {
+                let result
+                switch (rpc.method) {
+                  case 'connect':
+                    result = 'ack'
+                    break
+                  case 'get_public_key':
+                    result = idA
+                    break
+                  case 'switch_relays':
+                    result = JSON.stringify(network.switchTo)
+                    break
+                  case 'logout':
+                    result = 'ack'
+                    break
+                  case 'ping':
+                    result = 'pong'
+                    break
+                  case 'sign_event':
+                    result = JSON.stringify(
+                      network.transform(
+                        finalizeEvent(
+                          JSON.parse(rpc.params[0]),
+                          hexToBytes(keyA)
+                        )
+                      )
+                    )
+                    break
+                  case 'nip04_encrypt':
+                    result = await nip04.encrypt(
+                      keyA,
+                      rpc.params[0],
+                      rpc.params[1]
+                    )
+                    break
+                  case 'nip04_decrypt':
+                    result = await nip04.decrypt(
+                      keyA,
+                      rpc.params[0],
+                      rpc.params[1]
+                    )
+                    break
+                  case 'nip44_encrypt':
+                    result = nip44.v2.encrypt(
+                      rpc.params[1],
+                      nip44.v2.utils.getConversationKey(
+                        hexToBytes(keyA),
+                        rpc.params[0]
+                      )
+                    )
+                    break
+                  case 'nip44_decrypt':
+                    result = nip44.v2.decrypt(
+                      rpc.params[1],
+                      nip44.v2.utils.getConversationKey(
+                        hexToBytes(keyA),
+                        rpc.params[0]
+                      )
+                    )
+                    break
+                  default:
+                    network.reply(request, {
+                      error:
+                        'Unsupported remote method including sensitive payload'
+                    })
+                    return
+                }
+                network.reply(request, {result})
+              })
+            return 'ok'
+          }
+        }
+      },
+      destroy() {
+        this.destroyed = true
+        subscriptions.forEach(sub => sub.close())
+      }
+    }
+    this.pools.push(pool)
+    return pool
+  }
+  reply(request, payload, signingKey = keyB, changes = {}) {
+    const key = nip44.v2.utils.getConversationKey(
+      hexToBytes(signingKey),
+      request.client
+    )
+    const envelope = clone(
+      finalizeEvent(
+        {
+          kind: 24133,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: [['p', request.client]],
+          content: nip44.v2.encrypt(
+            JSON.stringify({id: request.id, ...payload}),
+            key
+          ),
+          ...changes
+        },
+        hexToBytes(signingKey)
+      )
+    )
+    this.emit(envelope)
+    return envelope
+  }
+  emit(envelope) {
+    for (const sub of [...this.subscriptions])
+      sub.handlers.onevent(clone(envelope))
+  }
+  deviceScans(uri, secret) {
+    const url = new URL(uri)
+    return this.reply(
+      {id: 'connect-response', client: url.hostname},
+      {result: secret ?? url.searchParams.get('secret')}
+    )
+  }
+}
+const bunker = `bunker://${idB}?relay=${encodeURIComponent(
+  DEFAULT_RELAY
+)}&secret=one-use`
+const credentials = () => ({
+  clientKey: keyPeer,
+  signerPubkey: idB,
+  relays: [DEFAULT_RELAY],
+  userPubkey: idA,
+  type: 'remote',
+  name: 'Device'
+})
+async function until(check) {
+  for (let i = 0; i < 300; i++) {
+    if (await check()) return
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  throw new Error('Expected asynchronous state was not reached')
+}
+async function remoteSetup() {
+  const network = new RemoteNetwork()
+  const m = mock(undefined, {sessionFactory: network.sessionFactory})
+  await m.signer.store.addRemote(idA, credentials(), 'Device')
+  return {m, network}
+}
+
+test('NIP-46 validates connection strings and secure relay URLs', () => {
+  assert.equal(DEFAULT_RELAY, 'wss://relay.nostr.com')
+  assert.equal(bunkerPointer(bunker).signerPubkey, idB)
+  for (const input of [
+    '',
+    'https://example.com',
+    `bunker://${idB}`,
+    `bunker://${idB}?relay=ws://localhost`,
+    `bunker://${idB}/invalid?relay=wss://example.com`
+  ])
+    assert.throws(() => bunkerPointer(input), /valid bunker/)
+  for (const urls of [
+    [],
+    ['https://example.com'],
+    ['wss://name:password@example.com'],
+    ['wss://example.com/#secret']
+  ])
+    assert.throws(() => relayURLs(urls))
+  const first = newPairing([DEFAULT_RELAY])
+  const second = newPairing([DEFAULT_RELAY])
+  assert.notEqual(first.credentials.clientKey, second.credentials.clientKey)
+  assert.notEqual(
+    new URL(first.uri).searchParams.get('secret'),
+    new URL(second.uri).searchParams.get('secret')
+  )
+})
+
+test('both NIP-46 pairing directions discover the user key separately from signer key', async () => {
+  for (const display of [false, true]) {
+    const network = new RemoteNetwork()
+    const pair = newPairing([DEFAULT_RELAY], display ? '' : bunker)
+    const session = network.sessionFactory(pair.credentials, {})
+    try {
+      const result = session.pair(display)
+      if (display) {
+        await until(() => network.subscriptions.size)
+        network.deviceScans(pair.uri, 'incorrect-secret')
+        assert.equal(session.credentials.signerPubkey, undefined)
+        network.deviceScans(pair.uri)
+      }
+      assert.equal(await result, idA)
+      assert.equal(session.credentials.signerPubkey, idB)
+      assert.equal(session.credentials.secret, undefined)
+      if (!display)
+        assert.deepEqual(network.requests[0].params.slice(0, 3), [
+          idB,
+          'one-use',
+          ''
+        ])
+    } finally {
+      session.close()
+    }
+    assert.ok(network.pools.every(pool => pool.destroyed))
+  }
+})
+
+test('pairing management persists credentials, rejects duplicates, and restricts callers', async () => {
+  const {m, network} = await remoteSetup()
+  const first = await m.manage('pairStart', {bunker})
+  await until(() => m.signer.remote.pairing?.status === 'error')
+  assert.match(
+    (await m.manage('pairState', {id: first.id})).errorMessage,
+    /already been added/
+  )
+  await m.manage('remove', {id: idA})
+  const next = await m.manage('pairStart', {
+    relays: [DEFAULT_RELAY],
+    name: 'Hardware'
+  })
+  await until(() => network.subscriptions.size)
+  network.deviceScans(next.uri)
+  await until(() => m.signer.remote.pairing?.status === 'paired')
+  const saved = await m.signer.store.read(state => state.identities[idA])
+  assert.equal(saved.name, 'Hardware')
+  assert.equal(saved.signerPubkey, idB)
+  assert.equal(saved.userPubkey, idA)
+  assert.equal(saved.secret, undefined)
+  const publicData = JSON.stringify(await m.manage('state'))
+  assert.ok(!publicData.includes(saved.clientKey))
+  assert.ok(!publicData.includes('privateKey'))
+  await assert.rejects(
+    m.manage('export', {id: idA}),
+    /stay on the signing device/
+  )
+  const page = await m.page('untrusted.test')
+  for (const sender of [
+    page.sender,
+    {...m.ui, frameId: 1},
+    {...m.ui, url: m.api.runtime.getURL('popup.html')}
+  ]) {
+    const response = await m.signer.handle(
+      {channel: 'manage', action: 'pairStart', args: {bunker}},
+      sender
+    )
+    assert.ok(response.error)
+  }
+  m.restart()
+  assert.equal((await m.manage('state')).identities[0].type, 'remote')
+})
+
+test('cancelled, expired, and unreachable pairings leave no identity or live session', async t => {
+  const network = new RemoteNetwork()
+  const m = mock(undefined, {sessionFactory: network.sessionFactory})
+  const pair = await m.manage('pairStart', {relays: [DEFAULT_RELAY]})
+  await until(() => network.subscriptions.size)
+  await m.manage('pairCancel', {id: pair.id})
+  network.deviceScans(pair.uri)
+  assert.deepEqual((await m.manage('state')).identities, [])
+  assert.equal(network.subscriptions.size, 0)
+  t.mock.timers.enable({apis: ['setTimeout']})
+  const expired = await m.manage('pairStart', {relays: [DEFAULT_RELAY]})
+  t.mock.timers.tick(240000)
+  await until(() => m.signer.remote.pairing?.status === 'error')
+  assert.match(
+    (await m.manage('pairState', {id: expired.id})).errorMessage,
+    /expired/
+  )
+  t.mock.timers.reset()
+  network.failOpen = true
+  await m.manage('pairStart', {bunker})
+  await until(() => m.signer.remote.pairing?.status === 'error')
+  assert.match(m.signer.remote.pairing.error, /Unable to connect/)
+  assert.deepEqual((await m.manage('state')).identities, [])
+  assert.ok(network.pools.every(pool => pool.destroyed))
+})
+
+test('remote website permissions block transmission and previews do not invoke device operations', async () => {
+  const {m, network} = await remoteSetup()
+  const page = await m.page('remote.test')
+  const result = page.call('nip44.encrypt', {
+    peer,
+    plaintext: 'private message'
+  })
+  const approval = await m.prompt()
+  assert.equal(await approval.call('preview', {identityId: idA}), null)
+  assert.equal(network.requests.length, 0)
+  await approval.call('answer', {identityId: idA, accept: false})
+  assert.match((await result).error.message, /denied/)
+  await m.manage('assign', {id: idA, host: 'remote.test'})
+  const reloaded = await m.page('remote.test', 'new-document')
+  await m.signer.store.mutate(state =>
+    updatePermission(state, idA, 'remote.test', 'signEvent', false, {})
+  )
+  assert.match(
+    (await reloaded.call('signEvent', {event})).error.message,
+    /denied/
+  )
+  assert.equal(network.requests.length, 0)
+})
+
+test('all cryptographic NIP-07 methods use the remote user key and survive a worker restart', async () => {
+  const {m, network} = await remoteSetup()
+  await m.manage('assign', {id: idA, host: 'remote.test'})
+  for (const type of [
+    'getPublicKey',
+    'signEvent',
+    'nip04.encrypt',
+    'nip04.decrypt',
+    'nip44.encrypt',
+    'nip44.decrypt'
+  ])
+    await allow(m, idA, 'remote.test', type)
+  m.restart()
+  const page = await m.page('remote.test')
+  assert.equal(await page.call('getPublicKey'), idA)
+  assert.equal(network.requests.length, 0)
+  const signed = await page.call('signEvent', {event})
+  assert.equal(signed.pubkey, idA)
+  assert.ok(verifyEvent(signed))
+  for (const nip of ['nip04', 'nip44']) {
+    const encrypted = await page.call(`${nip}.encrypt`, {
+      peer,
+      plaintext: 'hello remote'
+    })
+    const plaintext =
+      nip === 'nip04'
+        ? await nip04.decrypt(keyPeer, idA, encrypted)
+        : nip44.v2.decrypt(
+            encrypted,
+            nip44.v2.utils.getConversationKey(hexToBytes(keyPeer), idA)
+          )
+    assert.equal(plaintext, 'hello remote')
+    const incoming =
+      nip === 'nip04'
+        ? await nip04.encrypt(keyPeer, idA, 'hello extension')
+        : nip44.v2.encrypt(
+            'hello extension',
+            nip44.v2.utils.getConversationKey(hexToBytes(keyPeer), idA)
+          )
+    assert.equal(
+      await page.call(`${nip}.decrypt`, {peer, ciphertext: incoming}),
+      'hello extension'
+    )
+  }
+  assert.ok(network.pools.every(pool => pool.destroyed))
+  assert.equal(m.signer.remote.jobs.size, 0)
+})
+
+test('remote signing rejects valid signatures on changed fields or another user key', async () => {
+  const {m, network} = await remoteSetup()
+  await m.manage('assign', {id: idA, host: 'remote.test'})
+  await allow(m, idA, 'remote.test', 'signEvent')
+  const page = await m.page('remote.test')
+  for (const field of [
+    'content',
+    'kind',
+    'created_at',
+    'tags',
+    'pubkey',
+    'sig'
+  ]) {
+    network.transform = signed => {
+      if (field === 'pubkey') return finalizeEvent({...event}, hexToBytes(keyB))
+      if (field === 'sig') return {...signed, sig: '00'.repeat(64)}
+      const value =
+        field === 'content'
+          ? 'tampered'
+          : field === 'tags'
+          ? [['x', 'changed']]
+          : signed[field] + 1
+      return finalizeEvent({...signed, [field]: value}, hexToBytes(keyA))
+    }
+    assert.match(
+      (await page.call('signEvent', {event})).error.message,
+      /invalid or changed/
+    )
+  }
+})
+
+test('response correlation, authentication challenges, forged and duplicate responses', async () => {
+  const network = new RemoteNetwork()
+  network.auto = false
+  const auth = []
+  const session = network.sessionFactory(credentials(), {
+    onauth: url => auth.push(url)
+  })
+  try {
+    await session.open()
+    const first = session.request('first')
+    const second = session.request('second')
+    const [a, b] = network.requests
+    let settled = false
+    first.then(() => {
+      settled = true
+    })
+    network.reply(a, {result: 'wrong author'}, keyA)
+    const bad = network.reply(
+      {...a, id: 'unknown'},
+      {result: 'unknown request'}
+    )
+    network.emit({...bad, id: '0'.repeat(64)})
+    network.reply(a, {result: 'old'}, keyB, {created_at: session.started - 1})
+    network.reply(a, {result: 'wrong recipient'}, keyB, {tags: [['p', idB]]})
+    network.reply(a, {result: 'auth_url', error: 'javascript:alert(1)'})
+    network.reply(a, {result: 'auth_url', error: 'https://signer.example/auth'})
+    assert.deepEqual(auth, ['https://signer.example/auth'])
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(settled, false)
+    network.reply(b, {result: 'two'})
+    network.reply(a, {result: 'one'})
+    network.reply(a, {result: 'duplicate'})
+    assert.deepEqual(await Promise.all([first, second]), ['one', 'two'])
+    const denied = session.request('denied')
+    network.reply(network.requests.at(-1), {error: `sensitive ${keyA}`})
+    await assert.rejects(
+      denied,
+      error => !error.message.includes(keyA) && /denied/.test(error.message)
+    )
+    assert.equal(session.pending.size, 0)
+  } finally {
+    session.close()
+  }
+})
+
+test('request timeout, malformed requests, publication failure and abort clean up RPC listeners', async () => {
+  const network = new RemoteNetwork()
+  network.auto = false
+  const controller = new AbortController()
+  const session = network.sessionFactory(credentials(), {
+    signal: controller.signal
+  })
+  try {
+    await session.open()
+    await assert.rejects(session.request('ping', [], 5), /timed out/)
+    assert.equal(session.pending.size, 0)
+    await assert.rejects(session.request('invalid', [1n]))
+    assert.equal(session.pending.size, 0)
+    network.failPublish = true
+    await assert.rejects(session.request('ping'), /Unable to send/)
+    network.failPublish = false
+    const waiting = session.request('ping')
+    controller.abort()
+    await assert.rejects(waiting, /cancelled/)
+    assert.equal(session.pending.size, 0)
+    assert.equal(network.subscriptions.size, 0)
+  } finally {
+    session.close()
+  }
+})
+
+test('relay switching persists secure replacements before forwarding requests', async () => {
+  const {m, network} = await remoteSetup()
+  network.switchTo = ['wss://replacement.example']
+  await m.manage('assign', {id: idA, host: 'remote.test'})
+  await allow(m, idA, 'remote.test', 'signEvent')
+  const page = await m.page('remote.test')
+  assert.ok(verifyEvent(await page.call('signEvent', {event})))
+  assert.equal(
+    network.requests.find(request => request.method === 'sign_event').relay,
+    'wss://replacement.example/'
+  )
+  assert.deepEqual((await m.signer.store.read()).identities[idA].relays, [
+    'wss://replacement.example/'
+  ])
+  network.switchTo = ['https://unsafe.example']
+  assert.match((await page.call('signEvent', {event})).error.message, /wss/)
+})
+
+test('removal, reassignment and closing remote waiting windows cancel outstanding requests', async () => {
+  for (const action of ['remove', 'assign', 'close']) {
+    const {m, network} = await remoteSetup()
+    await m.manage('add', {key: keyB})
+    await m.manage('assign', {id: idA, host: 'remote.test'})
+    await allow(m, idA, 'remote.test', 'signEvent')
+    const page = await m.page('remote.test')
+    network.holdMethods.add('sign_event')
+    const result = page.call('signEvent', {event})
+    await until(() =>
+      network.requests.some(item => item.method === 'sign_event')
+    )
+    const request = network.requests.find(item => item.method === 'sign_event')
+    if (action === 'close') {
+      const job = [...m.signer.remote.jobs.values()][0]
+      network.reply(request, {
+        result: 'auth_url',
+        error: 'https://signer.example/auth'
+      })
+      await until(() => job.windowId !== undefined)
+      m.signer.windowRemoved(job.windowId)
+    } else
+      await m.manage(action, {
+        id: action === 'assign' ? idB : idA,
+        host: 'remote.test'
+      })
+    network.reply(request, {
+      result: JSON.stringify(finalizeEvent({...event}, hexToBytes(keyA)))
+    })
+    assert.ok((await result).error)
+    assert.equal(m.signer.remote.jobs.size, 0)
+    if (action === 'remove') {
+      assert.ok(!JSON.stringify(m.api.storage.local.data).includes(keyPeer))
+      // Finish courtesy logout without waiting on its bounded timeout.
+      await until(() => network.requests.some(item => item.method === 'logout'))
+      network.reply(
+        network.requests.find(item => item.method === 'logout'),
+        {result: 'ack'}
+      )
+    }
+  }
+})
+
+test('version-one migration preserves local identities and permissions when adding remote identities', async () => {
+  const policies = {
+    [idB]: {
+      'local.test': {true: {getPublicKey: {conditions: {}, created_at: 1}}}
+    }
+  }
+  const original = {
+    version: 1,
+    identities: {[idB]: {privateKey: keyB, name: 'Existing'}},
+    sites: {'local.test': {identityId: idB, revision: 4}},
+    policies
+  }
+  const m = mock({[STORAGE_KEY]: original})
+  await m.signer.store.addRemote(idA, credentials(), 'Device')
+  const stored = await m.signer.store.read()
+  assert.equal(stored.version, 2)
+  assert.deepEqual(clone(stored.sites), original.sites)
+  assert.deepEqual(clone(stored.policies), original.policies)
+  assert.equal(stored.identities[idB].privateKey, keyB)
+  assert.equal(stored.identities[idB].type, 'local')
+})
+
+test('migration verification tolerates Chrome storage reordering object properties', async () => {
+  const storage = memory({private_key: keyB})
+  const get = storage.get.bind(storage)
+  const reordered = value =>
+    Array.isArray(value)
+      ? value.map(reordered)
+      : value && typeof value === 'object'
+      ? Object.fromEntries(
+          Object.keys(value)
+            .sort()
+            .map(key => [key, reordered(value[key])])
+        )
+      : value
+  storage.get = async keys => reordered(await get(keys))
+  const store = new IdentityStore(storage)
+  assert.equal((await store.read()).identities[idB].privateKey, keyB)
+  assert.equal(storage.data.private_key, undefined)
+})
+
+test('remote authentication window status and cancellation require the exact trusted window', async () => {
+  const {m, network} = await remoteSetup()
+  await m.manage('assign', {id: idA, host: 'remote.test'})
+  await allow(m, idA, 'remote.test', 'signEvent')
+  const page = await m.page('remote.test')
+  network.holdMethods.add('sign_event')
+  const result = page.call('signEvent', {event})
+  await until(() =>
+    network.requests.some(request => request.method === 'sign_event')
+  )
+  const job = [...m.signer.remote.jobs.values()][0]
+  network.reply(
+    network.requests.find(request => request.method === 'sign_event'),
+    {result: 'auth_url', error: 'https://signer.example/auth'}
+  )
+  await until(() => job.windowId !== undefined)
+  const sender = {
+    id: m.api.runtime.id,
+    url: `${m.api.runtime.getURL('remote.html')}?id=${job.id}`,
+    tab: {windowId: job.windowId}
+  }
+  const message = {channel: 'remote-work', id: job.id, action: 'state'}
+  for (const untrusted of [
+    page.sender,
+    m.ui,
+    {...sender, frameId: 1},
+    {...sender, tab: {windowId: -1}},
+    {...sender, id: 'other-extension'}
+  ])
+    assert.ok((await m.signer.handle(message, untrusted)).error)
+  const state = await m.signer.handle(message, sender)
+  assert.equal(state.host, 'remote.test')
+  assert.ok(!JSON.stringify(state).includes(keyPeer))
+  assert.ok(!JSON.stringify(state).includes(event.content))
+  assert.ok(
+    (
+      await m.signer.handle(
+        {channel: 'manage', action: 'export', args: {id: idA}},
+        sender
+      )
+    ).error
+  )
+  assert.equal(
+    await m.signer.handle({...message, action: 'cancel'}, sender),
+    true
+  )
+  assert.match((await result).error.message, /cancelled/)
+})
+
+test('website bridge expires interrupted requests and ignores late responses', async () => {
+  const timers = new Map()
+  let next = 1
+  let receive
+  const window = {
+    postMessage() {},
+    addEventListener(type, callback) {
+      receive = callback
+    }
+  }
+  runInNewContext(readFileSync('extension/nostr-provider.js', 'utf8'), {
+    window,
+    document: {addEventListener() {}},
+    crypto: {randomUUID: () => String(next++)},
+    setTimeout(callback, duration) {
+      const id = next++
+      timers.set(id, {callback, duration})
+      return id
+    },
+    clearTimeout(id) {
+      timers.delete(id)
+    }
+  })
+  const pending = window.nostr.getPublicKey()
+  const failure = assert.rejects(pending, /Request expired/)
+  const id = Object.keys(window.nostr._requests)[0]
+  const timer = [...timers.values()][0]
+  assert.equal(timer.duration, 600000)
+  timer.callback()
+  await failure
+  assert.equal(Object.keys(window.nostr._requests).length, 0)
+  receive({source: window, data: {id, ext: 'nos2x', response: idA}})
+  assert.equal(Object.keys(window.nostr._requests).length, 0)
+  const normal = window.nostr.getPublicKey()
+  const normalId = Object.keys(window.nostr._requests)[0]
+  const normalTimer = window.nostr._requests[normalId].timer
+  receive({source: window, data: {id: normalId, ext: 'nos2x', response: idA}})
+  assert.equal(await normal, idA)
+  assert.equal(timers.has(normalTimer), false)
+})
+
+test('approved remote requests run without opening a waiting window', async () => {
+  const {m, network} = await remoteSetup()
+  await m.manage('assign', {id: idA, host: 'quiet.test'})
+  await allow(m, idA, 'quiet.test', 'signEvent')
+  await allow(m, idA, 'quiet.test', 'nip44.encrypt')
+  let opened = 0
+  m.api.windows.create = async () => {
+    opened++
+    throw new Error('Unexpected window')
+  }
+  const page = await m.page('quiet.test')
+  assert.ok(verifyEvent(await page.call('signEvent', {event})))
+  assert.equal(
+    typeof (await page.call('nip44.encrypt', {
+      peer,
+      plaintext: 'quiet encryption'
+    })),
+    'string'
+  )
+  assert.equal(opened, 0)
+  assert.ok(network.pools.every(pool => pool.destroyed))
+})
+
+test('authentication challenges open one window and clean it up after signing', async () => {
+  const {m, network} = await remoteSetup()
+  await m.manage('assign', {id: idA, host: 'auth.test'})
+  await allow(m, idA, 'auth.test', 'signEvent')
+  network.holdMethods.add('sign_event')
+  const page = await m.page('auth.test')
+  const result = page.call('signEvent', {event})
+  await until(() =>
+    network.requests.some(request => request.method === 'sign_event')
+  )
+  assert.equal(m.windows.size, 0)
+  const request = network.requests.find(
+    request => request.method === 'sign_event'
+  )
+  const challenge = {result: 'auth_url', error: 'https://signer.example/auth'}
+  network.reply(request, challenge)
+  network.reply(request, challenge)
+  await until(() => m.windows.size === 1)
+  const job = [...m.signer.remote.jobs.values()][0]
+  assert.equal(job.authURL, challenge.error)
+  network.reply(request, {
+    result: JSON.stringify(finalizeEvent({...event}, hexToBytes(keyA)))
+  })
+  assert.ok(verifyEvent(await result))
+  assert.equal(m.windows.size, 0)
+})
+
+test('authentication windows created after a response are still closed', async () => {
+  const {m, network} = await remoteSetup()
+  await m.manage('assign', {id: idA, host: 'auth.test'})
+  await allow(m, idA, 'auth.test', 'signEvent')
+  network.holdMethods.add('sign_event')
+  const create = m.api.windows.create.bind(m.api.windows)
+  let completeCreation
+  m.api.windows.create = options =>
+    new Promise(resolve => {
+      completeCreation = async () => resolve(await create(options))
+    })
+  const page = await m.page('auth.test')
+  const result = page.call('signEvent', {event})
+  await until(() =>
+    network.requests.some(request => request.method === 'sign_event')
+  )
+  const request = network.requests.find(
+    request => request.method === 'sign_event'
+  )
+  network.reply(request, {
+    result: 'auth_url',
+    error: 'https://signer.example/auth'
+  })
+  network.reply(request, {
+    result: JSON.stringify(finalizeEvent({...event}, hexToBytes(keyA)))
+  })
+  await completeCreation()
+  assert.ok(verifyEvent(await result))
+  assert.equal(m.windows.size, 0)
 })

@@ -1,4 +1,5 @@
 import {SafeError, errorResponse} from './errors'
+import {RemoteManager} from './remote-manager'
 import {Mutex} from 'async-mutex'
 import {hexToBytes} from '@noble/hashes/utils.js'
 import {finalizeEvent, validateEvent} from 'nostr-tools/pure'
@@ -25,8 +26,9 @@ const fail = message => {
   throw new SafeError(message)
 }
 
-export function createSigner(browser) {
+export function createSigner(browser, dependencies = {}) {
   const store = new IdentityStore(browser.storage.local)
+  const remote = new RemoteManager(browser, store, dependencies.sessionFactory)
   // Do not read keys or answer requests unless untrusted contexts are excluded.
   const ready = Promise.resolve().then(() =>
     browser.storage.local.setAccessLevel({accessLevel: 'TRUSTED_CONTEXTS'})
@@ -77,11 +79,12 @@ export function createSigner(browser) {
     })
   }
 
-  async function operation(identity, id, type, params) {
+  async function operation(identity, id, type, params, host) {
+    if (type === 'getPublicKey') return id
+    if (identity.type === 'remote')
+      return remote.operation(identity, id, type, params, host)
     const sk = hexToBytes(identity.privateKey)
     switch (type) {
-      case 'getPublicKey':
-        return id
       case 'signEvent': {
         if (params.event?.pubkey && params.event.pubkey !== id)
           fail('Event public key does not match this website’s identity')
@@ -117,7 +120,7 @@ export function createSigner(browser) {
       if (!state.identities[id]) fail(RELOAD_ERROR)
       return state.identities[id]
     })
-    const result = await operation(identity, id, type, params)
+    const result = await operation(identity, id, type, params, host)
     await store.read(state => {
       assertCurrent(state, host, expected)
       if (!state.identities[id]) fail(RELOAD_ERROR)
@@ -227,7 +230,11 @@ export function createSigner(browser) {
       if (p.assignedId && message.identityId !== p.assignedId)
         fail('Identity does not match this request')
       p.selectedId = message.identityId
-      if (p.type === 'signEvent') return null
+      const isRemote = await store.read(
+        state => state.identities[message.identityId]?.type === 'remote'
+      )
+      if (p.type === 'signEvent' || (isRemote && p.type !== 'getPublicKey'))
+        return null
       return execute(p.host, p.expected, message.identityId, p.type, p.params)
     }
     if (message.action !== 'answer' || typeof message.accept !== 'boolean')
@@ -357,6 +364,8 @@ export function createSigner(browser) {
         if (!sender.id) fail('Missing extension caller')
         return await request(message, sender, true)
       }
+      if (message.channel === 'remote-work')
+        return remote.workMessage(message, sender)
       if (message.channel === 'prompt')
         return await promptMessage(message, sender)
       if (message.channel === 'manage') {
@@ -370,7 +379,26 @@ export function createSigner(browser) {
           sender.url?.split('?')[0] !== extensionURL + 'options.html'
         )
           fail('Private keys can only be exported from the options page')
+        if (['pairStart', 'pairState', 'pairCancel'].includes(message.action)) {
+          if (sender.url?.split('?')[0] !== extensionURL + 'options.html')
+            fail('Only the options page can pair a remote signer')
+          if (message.action === 'pairStart')
+            return remote.startPairing(message.args || {})
+          if (message.action === 'pairState')
+            return remote.pairingState(message.args?.id)
+          return remote.cancelPairing(message.args?.id)
+        }
+        const removed =
+          message.action === 'remove'
+            ? await store.read(state => state.identities[message.args.id])
+            : null
         const result = await store.manage(message.action, message.args)
+        if (message.action === 'remove') {
+          remote.cancel({id: message.args.id})
+          if (removed?.type === 'remote') remote.logout(removed).catch(() => {})
+        }
+        if (message.action === 'assign')
+          remote.cancel({host: message.args.host})
         if (message.action === 'remove')
           for (const key of secrets.keys())
             if (key.startsWith(message.args.id + ':')) secrets.delete(key)
@@ -397,7 +425,9 @@ export function createSigner(browser) {
   return {
     handle,
     store,
+    remote,
     windowRemoved(id) {
+      remote.windowRemoved(id)
       if (pending?.windowId === id) pending.reject(new SafeError('denied'))
     },
     async tabRemoved(id) {

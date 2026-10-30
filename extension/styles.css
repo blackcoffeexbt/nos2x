@@ -13,7 +13,8 @@ h3 {
 }
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
   padding: 7px 10px;
   max-width: 100%;
@@ -26,7 +27,8 @@ button:disabled {
   cursor: default;
 }
 input:not([type='checkbox']),
-select {
+select,
+textarea {
   width: 100%;
 }
 label {
@@ -34,7 +36,8 @@ label {
   margin: 12px 0;
 }
 label input,
-label select {
+label select,
+label textarea {
   display: block;
   margin-top: 4px;
 }
@@ -101,6 +104,25 @@ td {
   overflow-wrap: anywhere;
 }
 svg {
+  max-width: 100%;
+  height: auto;
+}
+
+textarea {
+  min-height: 72px;
+  resize: vertical;
+  overflow-wrap: anywhere;
+}
+
+.pairing-qr {
+  display: table;
+  padding: 24px;
+  background: #fff;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.pairing-qr svg {
+  display: block;
   max-width: 100%;
   height: auto;
 }
